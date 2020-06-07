@@ -114,15 +114,41 @@ class ResNet_s(nn.Module):
         return nn.Sequential(*layers)
 
     def forward(self, x):
+        # out = F.relu(self.bn1(self.conv1(x)))
+        # out = self.layer1(out)
+        # out = self.layer2(out)
+        # out = self.layer3(out)
+        # out = F.avg_pool2d(out, out.size()[3])
+        # out = out.view(out.size(0), -1)
+        # out = self.linear(out)
+        # return out
+        return self.forward_partial(x, -1)
+
+    def forward_partial(self, x, num_layers):
+        """
+        if num_layers = -1, run all the layers.
+        otherwise, run num_layers layers and return output
+        """
         out = F.relu(self.bn1(self.conv1(x)))
+        if num_layers == 1:
+            return out
         out = self.layer1(out)
+        if num_layers == 2:
+            return out
         out = self.layer2(out)
+        if num_layers == 3:
+            return out
         out = self.layer3(out)
+        if num_layers == 4:
+            return out
         out = F.avg_pool2d(out, out.size()[3])
+        if num_layers == 5:
+            return out
         out = out.view(out.size(0), -1)
+        if num_layers == 6:
+            return out
         out = self.linear(out)
         return out
-
 
 def resnet20():
     return ResNet_s(BasicBlock, [3, 3, 3])

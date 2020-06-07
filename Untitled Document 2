@@ -1,0 +1,22 @@
+Because the test sets are imbalanced, the variation in accuracies might be more than usual. So we decided to run each test multiple times and report the variance. (with multiple data sets and multiple trials)
+
+Maybe also report accuracy by class rarity, (how well the model performs on rare classes compared to other models?)
+
+https://github.com/mynameisfiber/pyxmeans is a way to do k-means and automatically determine k.
+
+TODO:
+tomorrow, i'll write up the algorithm in latex and implementit
+
+input layer
+second to last layer
+all but last layer (average together)
+
+the labels: 3 ways: just treat the labels like another layer (and average)
+first do k-means and then plit by label
+first split by label and then do kmeans
+
+
+due to the curse of dimensionality, fewer dimension(~10-15) has higher accuracy of finding the right number of clusters.
+
+To find the meaningful number of representations, we use X-means method to find the meaningful number of clusters. X-means is extension of K-means which doesn't need prompt of the number of clusters and it guarantees the global minima whereas K-means could find worse local minima given fixed K. kd tree, blacklisting
+https://www.cs.cmu.edu/~dpelleg/download/xmeans.pdf

@@ -18,7 +18,7 @@ class FocalLoss(nn.Module):
         self.weight = weight
 
     def forward(self, input, target):
-        return focal_loss(F.cross_entropy(input, target, reduction='none', weight=self.weight), self.gamma)
+        return focal_loss(F.cross_entropy(input, target, reduction='none', weight= self.weight), self.gamma)
 
 class LDAMLoss(nn.Module):
     
@@ -40,6 +40,6 @@ class LDAMLoss(nn.Module):
         batch_m = torch.matmul(self.m_list[None, :], index_float.transpose(0,1))
         batch_m = batch_m.view((-1, 1))
         x_m = x - batch_m
-    
+
         output = torch.where(index, x_m, x)
         return F.cross_entropy(self.s*output, target, weight=self.weight)

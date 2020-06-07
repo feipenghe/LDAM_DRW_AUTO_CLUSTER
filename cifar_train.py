@@ -21,6 +21,10 @@ from utils import *
 from imbalance_cifar import IMBALANCECIFAR10, IMBALANCECIFAR100
 from losses import LDAMLoss, FocalLoss
 
+from pyclustering.cluster.xmeans import xmeans
+from pyclustering.utils import euclidean_distance
+
+
 model_names = sorted(name for name in models.__dict__
     if name.islower() and not name.startswith("__")
     and callable(models.__dict__[name]))
@@ -68,6 +72,7 @@ parser.add_argument('--gpu', default=None, type=int,
                     help='GPU id to use.')
 parser.add_argument('--root_log',type=str, default='log')
 parser.add_argument('--root_model', type=str, default='checkpoint')
+parser.add_argument('--cutoff_epoch', type=int, default = 160)
 best_acc1 = 0
 
 
@@ -105,6 +110,7 @@ def main_worker(gpu, ngpus_per_node, args):
     num_classes = 100 if args.dataset == 'cifar100' else 10
     use_norm = True if args.loss_type == 'LDAM' else False
     model = models.__dict__[args.arch](num_classes=num_classes, use_norm=use_norm)
+    non_gpu_model = models.__dict__[args.arch](num_classes=num_classes, use_norm=use_norm)
 
     if args.gpu is not None:
         torch.cuda.set_device(args.gpu)
@@ -163,7 +169,8 @@ def main_worker(gpu, ngpus_per_node, args):
     print('cls num list:')
     print(cls_num_list)
     args.cls_num_list = cls_num_list
-    
+
+
     train_sampler = None
         
     train_loader = torch.utils.data.DataLoader(
@@ -185,7 +192,7 @@ def main_worker(gpu, ngpus_per_node, args):
 
         if args.train_rule == 'None':
             train_sampler = None  
-            per_cls_weights = None 
+            per_cls_weights = None
         elif args.train_rule == 'Resample':
             train_sampler = ImbalancedDatasetSampler(train_dataset)
             per_cls_weights = None
@@ -198,19 +205,180 @@ def main_worker(gpu, ngpus_per_node, args):
             per_cls_weights = torch.FloatTensor(per_cls_weights).cuda(args.gpu)
         elif args.train_rule == 'DRW':
             train_sampler = None
-            idx = epoch // 160
+            idx = min(epoch // 160, 1)
             betas = [0, 0.9999]
             effective_num = 1.0 - np.power(betas[idx], cls_num_list)
             per_cls_weights = (1.0 - betas[idx]) / np.array(effective_num)
             per_cls_weights = per_cls_weights / np.sum(per_cls_weights) * len(cls_num_list)
             per_cls_weights = torch.FloatTensor(per_cls_weights).cuda(args.gpu)
+        elif args.train_rule == 'SWITCHING_DRW_AUTO_CLUSTER':
+            train_sampler = None
+            cutoff_epoch = args.cutoff_epoch
+            idx = min(epoch // cutoff_epoch, 1)
+            betas = [0, 0.9999]
+            if epoch >= cutoff_epoch + 10 and (epoch - cutoff_epoch) % 20 == 0:
+                max_real_ratio_number_of_labels = 20
+                # todo: transform data batch by batch, then concatentate...
+                temp_batch_size = int(train_dataset.data.shape[0])
+                temp_train_loader = torch.utils.data.DataLoader(
+                    train_dataset, batch_size=int(temp_batch_size), shuffle=(train_sampler is None),
+                    num_workers=args.workers, pin_memory=True, sampler=train_sampler)
+
+                transformed_data = None
+                transformed_labels = None
+                for i, (xs, labels) in enumerate(train_loader):
+                    transformed_batch_data = model.forward_partial(xs.cuda(), num_layers=6)
+                    transformed_batch_data = transformed_batch_data.cpu().detach()
+                    transformed_batch_data = transformed_batch_data.numpy()
+                    transformed_batch_data = np.reshape(transformed_batch_data, (transformed_batch_data.shape[0], -1))
+                    labels = np.array(labels)[:, np.newaxis]
+                    if transformed_data is None:
+                        transformed_data = transformed_batch_data
+                        transformed_labels = labels
+                    else:
+                        transformed_data = np.vstack((transformed_data, transformed_batch_data))
+                        # print(labels.shape)
+                        # print(transformed_labels.shape)
+                        transformed_labels = np.vstack((transformed_labels, labels))
+
+                xmean_model = xmeans(data=transformed_data, kmax=num_classes * max_real_ratio_number_of_labels)
+                xmean_model.process()
+                # Extract clustering results: clusters and their centers
+                clusters = xmean_model.get_clusters()
+                centers = xmean_model.get_centers()
+                new_labels = []
+                xs = transformed_data
+                centers = np.array(centers)
+                print("number of clusters: ", len(centers))
+                squared_norm_dist = np.sum((xs - centers[:, np.newaxis]) ** 2, axis=2)
+                data_centers = np.argmin(squared_norm_dist, axis=0)
+                data_centers = np.expand_dims(data_centers, axis=1)
+
+                new_labels = []
+                for i in range(len(transformed_labels)):
+                    new_labels.append(data_centers[i][0] + transformed_labels[i][0] * len(centers))
+
+                new_label_counts = {}
+                for label in new_labels:
+                    if label in new_label_counts.keys():
+                        new_label_counts[label] += 1
+                    else:
+                        new_label_counts[label] = 1
+
+                # print(new_label_counts)
+
+                per_cls_weights = []
+                for i in range(len(cls_num_list)):
+                    temp = []
+                    for j in range(len(centers)):
+                        new_label = j + i * len(centers)
+                        if new_label in new_label_counts:
+                            temp.append(new_label_counts[new_label])
+                    effective_num_temp = 1.0 - np.power(betas[idx], temp)
+                    per_cls_weights_temp = (1.0 - betas[idx]) / np.array(effective_num_temp)
+                    per_cls_weights.append(np.average(per_cls_weights_temp, weights=temp))
+                per_cls_weights = per_cls_weights / np.sum(per_cls_weights) * len(cls_num_list)
+                per_cls_weights = torch.FloatTensor(per_cls_weights).cuda(args.gpu)
+            elif epoch < cutoff_epoch or (epoch - cutoff_epoch) % 20 == 10:
+                effective_num = 1.0 - np.power(betas[idx], cls_num_list)
+                per_cls_weights = (1.0 - betas[idx]) / np.array(effective_num)
+                per_cls_weights = per_cls_weights / np.sum(per_cls_weights) * len(cls_num_list)
+                per_cls_weights = torch.FloatTensor(per_cls_weights).cuda(args.gpu)
+
+        elif args.train_rule == 'DRW_AUTO_CLUSTER':
+            train_sampler = None
+            cutoff_epoch = args.cutoff_epoch
+            idx = min(epoch // cutoff_epoch, 1)
+            betas = [0, 0.9999]
+            if epoch >= cutoff_epoch and (epoch - cutoff_epoch) % 10 == 0:
+                max_real_ratio_number_of_labels = 20
+                # todo: transform data batch by batch, then concatentate...
+                temp_batch_size = int(train_dataset.data.shape[0])
+                temp_train_loader = torch.utils.data.DataLoader(
+                    train_dataset, batch_size=int(temp_batch_size), shuffle=(train_sampler is None),
+                    num_workers=args.workers, pin_memory=True, sampler=train_sampler)
+
+                transformed_data = None
+                transformed_labels = None
+                for i, (xs, labels) in enumerate(train_loader):
+                    transformed_batch_data = model.forward_partial(xs.cuda(), num_layers=6)
+                    transformed_batch_data= transformed_batch_data.cpu().detach()
+                    transformed_batch_data = transformed_batch_data.numpy()
+                    transformed_batch_data= np.reshape(transformed_batch_data, (transformed_batch_data.shape[0], -1))
+                    labels = np.array(labels)[:, np.newaxis]
+                    if transformed_data is None:
+                        transformed_data = transformed_batch_data
+                        transformed_labels = labels
+                    else:
+                        transformed_data = np.vstack( (transformed_data, transformed_batch_data) )
+                        # print(labels.shape)
+                        # print(transformed_labels.shape)
+                        transformed_labels = np.vstack((transformed_labels, labels))
+
+                initial_centers = [np.zeros((transformed_data.shape[1],)) for i in range(num_classes)]
+                center_counts = [0 for i in range(num_classes)]
+                for i in range(transformed_data.shape[0]):
+                    temp_idx = transformed_labels[i][0]
+                    initial_centers[temp_idx] = initial_centers[temp_idx] + transformed_data[i,:]
+                    center_counts[temp_idx] = center_counts[temp_idx] + 1
+
+                for i in range(num_classes):
+                    initial_centers[i] = initial_centers[i] / center_counts[i]
+
+                xmean_model = xmeans(data=transformed_data, initial_centers=initial_centers, \
+                                     kmax=num_classes * max_real_ratio_number_of_labels)
+                xmean_model.process()
+                # Extract clustering results: clusters and their centers
+                clusters = xmean_model.get_clusters()
+                centers = xmean_model.get_centers()
+                new_labels = []
+                xs = transformed_data
+                centers = np.array(centers)
+                print("number of clusters: ", len(centers))
+                squared_norm_dist = np.sum((xs - centers[:, np.newaxis]) ** 2, axis = 2 )
+                data_centers = np.argmin(squared_norm_dist, axis = 0)
+                data_centers = np.expand_dims(data_centers, axis = 1)
+
+                new_labels = []
+                for i in range(len(transformed_labels)):
+                    new_labels.append(data_centers[i][0] + transformed_labels[i][0] * len(centers))
+
+                new_label_counts = {}
+                for label in new_labels:
+                    if label in new_label_counts.keys():
+                        new_label_counts[label] += 1
+                    else:
+                        new_label_counts[label] = 1
+
+                # print(new_label_counts)
+
+                per_cls_weights = []
+                for i in range(len(cls_num_list)):
+                    temp = []
+                    for j in range(len(centers)):
+                        new_label = j + i * len(centers)
+                        if new_label in new_label_counts:
+                            temp.append(new_label_counts[new_label])
+                    effective_num_temp = 1.0 - np.power(betas[idx], temp)
+                    per_cls_weights_temp = (1.0 - betas[idx]) / np.array(effective_num_temp)
+                    per_cls_weights.append(np.average(per_cls_weights_temp, weights=temp))
+                per_cls_weights = per_cls_weights / np.sum(per_cls_weights) * len(cls_num_list)
+                per_cls_weights = torch.FloatTensor(per_cls_weights).cuda(args.gpu)
+            elif epoch < cutoff_epoch:
+                effective_num = 1.0 - np.power(betas[idx], cls_num_list)
+                per_cls_weights = (1.0 - betas[idx]) / np.array(effective_num)
+                per_cls_weights = per_cls_weights / np.sum(per_cls_weights) * len(cls_num_list)
+                per_cls_weights = torch.FloatTensor(per_cls_weights).cuda(args.gpu)
+
         else:
             warnings.warn('Sample rule is not listed')
-        
+
         if args.loss_type == 'CE':
             criterion = nn.CrossEntropyLoss(weight=per_cls_weights).cuda(args.gpu)
         elif args.loss_type == 'LDAM':
             criterion = LDAMLoss(cls_num_list=cls_num_list, max_m=0.5, s=30, weight=per_cls_weights).cuda(args.gpu)
+            #temp = [cls_num_list[i] * per_cls_weights[i].item() for i in range(len(cls_num_list))]
+            #criterion = LDAMLoss(cls_num_list=temp, max_m=0.5, s=30, weight=per_cls_weights).cuda(args.gpu)
         elif args.loss_type == 'Focal':
             criterion = FocalLoss(weight=per_cls_weights, gamma=1).cuda(args.gpu)
         else:
@@ -293,10 +461,10 @@ def train(train_loader, model, criterion, optimizer, epoch, args, log, tf_writer
             log.write(output + '\n')
             log.flush()
 
-    tf_writer.add_scalar('loss/train', losses.avg, epoch)
-    tf_writer.add_scalar('acc/train_top1', top1.avg, epoch)
-    tf_writer.add_scalar('acc/train_top5', top5.avg, epoch)
-    tf_writer.add_scalar('lr', optimizer.param_groups[-1]['lr'], epoch)
+    # tf_writer.add_scalar('loss/train', losses.avg, epoch)
+    # tf_writer.add_scalar('acc/train_top1', top1.avg, epoch)
+    # tf_writer.add_scalar('acc/train_top5', top5.avg, epoch)
+    # tf_writer.add_scalar('lr', optimizer.param_groups[-1]['lr'], epoch)
 
 def validate(val_loader, model, criterion, epoch, args, log=None, tf_writer=None, flag='val'):
     batch_time = AverageMeter('Time', ':6.3f')
@@ -356,20 +524,21 @@ def validate(val_loader, model, criterion, epoch, args, log=None, tf_writer=None
             log.write(out_cls_acc + '\n')
             log.flush()
 
-        tf_writer.add_scalar('loss/test_'+ flag, losses.avg, epoch)
-        tf_writer.add_scalar('acc/test_' + flag + '_top1', top1.avg, epoch)
-        tf_writer.add_scalar('acc/test_' + flag + '_top5', top5.avg, epoch)
-        tf_writer.add_scalars('acc/test_' + flag + '_cls_acc', {str(i):x for i, x in enumerate(cls_acc)}, epoch)
+        # tf_writer.add_scalar('loss/test_'+ flag, losses.avg, epoch)
+        # tf_writer.add_scalar('acc/test_' + flag + '_top1', top1.avg, epoch)
+        # tf_writer.add_scalar('acc/test_' + flag + '_top5', top5.avg, epoch)
+        # tf_writer.add_scalars('acc/test_' + flag + '_cls_acc', {str(i):x for i, x in enumerate(cls_acc)}, epoch)
 
     return top1.avg
+
 
 def adjust_learning_rate(optimizer, epoch, args):
     """Sets the learning rate to the initial LR decayed by 10 every 30 epochs"""
     epoch = epoch + 1
     if epoch <= 5:
         lr = args.lr * epoch / 5
-    elif epoch > 180:
-        lr = args.lr * 0.0001
+    #elif epoch > 180:
+    #    lr = args.lr * 0.0001
     elif epoch > 160:
         lr = args.lr * 0.01
     else:
